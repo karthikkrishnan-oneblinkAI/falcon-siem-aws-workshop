@@ -1,0 +1,477 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template to deploy an AWS Organization with Security Hub, 
+  GuardDuty, and CloudTrail enabled. Designed for single-account AWS Workshop environments.
+  
+  The management account directly manages all security services (no delegated administrator).
+
+Resources:
+  #############################################
+  # AWS Organization
+  #############################################
+  Organization:
+    Type: AWS::Organizations::Organization
+    Properties:
+      FeatureSet: ALL
+
+  #############################################
+  # Organizational Units
+  #############################################
+  SecurityOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    DependsOn: Organization
+    Properties:
+      Name: Security
+      ParentId: !GetAtt Organization.RootId
+
+  WorkloadsOU:
+    Type: AWS::Organizations::OrganizationalUnit
+    DependsOn: Organization
+    Properties:
+      Name: Workloads
+      ParentId: !GetAtt Organization.RootId
+
+  #############################################
+  # Enable AWS Service Access for Organizations
+  #############################################
+  
+  # Custom Resource Lambda Role
+  ServiceAccessLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'OrgServiceAccessLambdaRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrganizationsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:EnableAWSServiceAccess
+                  - organizations:DisableAWSServiceAccess
+                  - organizations:ListAWSServiceAccessForOrganization
+                  - organizations:DescribeOrganization
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - securityhub:EnableSecurityHub
+                  - securityhub:DescribeHub
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - guardduty:CreateDetector
+                  - guardduty:ListDetectors
+                  - guardduty:GetDetector
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - securityhub.amazonaws.com
+                      - guardduty.amazonaws.com
+                      - cloudtrail.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - organizations:EnablePolicyType
+                  - organizations:DisablePolicyType
+                  - organizations:ListRoots
+                Resource: '*'
+
+  # Lambda Function for enabling service access
+  EnableServiceAccessLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'EnableOrgServiceAccess-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt ServiceAccessLambdaRole.Arn
+      Timeout: 600
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import time
+
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              
+              try:
+                  request_type = event['RequestType']
+                  properties = event['ResourceProperties']
+                  service_principal = properties['ServicePrincipal']
+                  service_type = properties.get('ServiceType')
+                  
+                  org_client = boto3.client('organizations')
+                  
+                  if request_type in ['Create', 'Update']:
+                      # SCP enablement doesn't use EnableAWSServiceAccess — handle separately
+                      if service_type == 'enable_scp':
+                          enable_scp_policy_type(properties.get('RootId'))
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                              'ServicePrincipal': service_principal
+                          })
+                          return
+                      
+                      # Enable AWS service access (with retries for concurrent modification)
+                      for attempt in range(1, 6):
+                          try:
+                              org_client.enable_aws_service_access(
+                                  ServicePrincipal=service_principal
+                              )
+                              print(f"Enabled service access for {service_principal}")
+                              break
+                          except org_client.exceptions.ConcurrentModificationException:
+                              print(f"Concurrent modification, retrying... (attempt {attempt}/5)")
+                              time.sleep(15)
+                          except Exception as e:
+                              if 'ConcurrentModification' in str(e):
+                                  print(f"Concurrent modification, retrying... (attempt {attempt}/5)")
+                                  time.sleep(15)
+                              else:
+                                  print(f"Error enabling service access: {str(e)}")
+                                  break
+                      
+                      # Wait and verify service access is actually active
+                      if not wait_for_service_access(org_client, service_principal):
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {
+                              'Error': f'Service access for {service_principal} did not become active within timeout'
+                          })
+                          return
+                      
+                      # Enable services in management account
+                      if service_type == 'securityhub':
+                          enable_security_hub()
+                      elif service_type == 'guardduty':
+                          enable_guardduty()
+                      elif service_type == 'cloudtrail':
+                          # Extra wait after verification for CloudTrail propagation
+                          print("Extra wait for CloudTrail propagation...")
+                          time.sleep(30)
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'ServicePrincipal': service_principal
+                      })
+                  
+                  elif request_type == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+          def wait_for_service_access(org_client, service_principal, max_attempts=20, interval=10):
+              """Poll until service access is confirmed active."""
+              for attempt in range(1, max_attempts + 1):
+                  try:
+                      response = org_client.list_aws_service_access_for_organization()
+                      enabled = [
+                          s['ServicePrincipal']
+                          for s in response.get('EnabledServicePrincipals', [])
+                      ]
+                      if service_principal in enabled:
+                          print(f"Verified: {service_principal} is active (attempt {attempt})")
+                          return True
+                      print(f"Waiting for {service_principal}... (attempt {attempt}/{max_attempts})")
+                  except Exception as e:
+                      print(f"Error checking service access (attempt {attempt}): {str(e)}")
+                  time.sleep(interval)
+              
+              print(f"TIMEOUT: {service_principal} not active after {max_attempts * interval}s")
+              return False
+
+          def enable_security_hub():
+              """Enable Security Hub in management account"""
+              sh_client = boto3.client('securityhub')
+              
+              try:
+                  sh_client.enable_security_hub(
+                      EnableDefaultStandards=True
+                  )
+                  print("Enabled Security Hub in management account")
+              except sh_client.exceptions.ResourceConflictException:
+                  print("Security Hub already enabled")
+              except Exception as e:
+                  print(f"Error enabling Security Hub: {str(e)}")
+
+          def enable_guardduty():
+              """Enable GuardDuty in management account"""
+              gd_client = boto3.client('guardduty')
+              
+              try:
+                  detectors = gd_client.list_detectors()
+                  if not detectors['DetectorIds']:
+                      gd_client.create_detector(Enable=True)
+                      print("Created GuardDuty detector in management account")
+                  else:
+                      print("GuardDuty detector already exists")
+              except Exception as e:
+                  print(f"Error with GuardDuty detector: {str(e)}")
+
+          def enable_scp_policy_type(root_id):
+              """Enable Service Control Policy type for the organization"""
+              org_client = boto3.client('organizations')
+              
+              try:
+                  org_client.enable_policy_type(
+                      RootId=root_id,
+                      PolicyType='SERVICE_CONTROL_POLICY'
+                  )
+                  print(f"Enabled SERVICE_CONTROL_POLICY for root {root_id}")
+              except org_client.exceptions.PolicyTypeAlreadyEnabledException:
+                  print("SERVICE_CONTROL_POLICY already enabled")
+              except Exception as e:
+                  print(f"Error enabling SCP policy type: {str(e)}")
+
+  #############################################
+  # Security Hub Configuration
+  #############################################
+  SecurityHubServiceAccess:
+    Type: Custom::EnableServiceAccess
+    DependsOn: 
+      - Organization
+      - EnableServiceAccessLambda
+    Properties:
+      ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
+      ServicePrincipal: securityhub.amazonaws.com
+      ServiceType: securityhub
+
+  #############################################
+  # GuardDuty Configuration
+  #############################################
+  GuardDutyServiceAccess:
+    Type: Custom::EnableServiceAccess
+    DependsOn:
+      - SecurityHubServiceAccess
+    Properties:
+      ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
+      ServicePrincipal: guardduty.amazonaws.com
+      ServiceType: guardduty
+
+  #############################################
+  # CloudTrail Configuration
+  #############################################
+  
+  # S3 Bucket for CloudTrail logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'org-cloudtrail-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            ExpirationInDays: 365
+      Tags:
+        - Key: Purpose
+          Value: CloudTrailLogs
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/OrganizationTrail'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/OrganizationTrail'
+          - Sid: AWSCloudTrailOrgWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/AWSLogs/${Organization.Id}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudTrailServiceAccess:
+    Type: Custom::EnableServiceAccess
+    DependsOn:
+      - GuardDutyServiceAccess
+    Properties:
+      ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
+      ServicePrincipal: cloudtrail.amazonaws.com
+      ServiceType: cloudtrail
+
+  # Organization CloudTrail
+  OrganizationTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - CloudTrailBucketPolicy
+      - CloudTrailServiceAccess
+      - SecurityHubServiceAccess
+      - GuardDutyServiceAccess
+    Properties:
+      TrailName: OrganizationTrail
+      S3BucketName: !Ref CloudTrailBucket
+      IsMultiRegionTrail: true
+      IsOrganizationTrail: true
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      Tags:
+        - Key: Purpose
+          Value: OrganizationAudit
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################
+  # Service Control Policies
+  #############################################
+  
+  # Enable SCP Policy Type first
+  EnableSCPPolicyType:
+    Type: Custom::EnableServiceAccess
+    DependsOn:
+      - Organization
+      - EnableServiceAccessLambda
+    Properties:
+      ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
+      ServicePrincipal: organizations.amazonaws.com
+      ServiceType: enable_scp
+      RootId: !GetAtt Organization.RootId
+
+  # Deny disabling security services SCP
+  DenyDisableSecurityServicesSCP:
+    Type: AWS::Organizations::Policy
+    DependsOn: EnableSCPPolicyType
+    Properties:
+      Name: DenyDisableSecurityServices
+      Description: Prevents disabling of security services like GuardDuty, Security Hub, and CloudTrail
+      Type: SERVICE_CONTROL_POLICY
+      Content:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyDisableGuardDuty
+            Effect: Deny
+            Action:
+              - guardduty:DeleteDetector
+              - guardduty:DeleteMembers
+              - guardduty:DisassociateFromMasterAccount
+              - guardduty:DisassociateMembers
+              - guardduty:StopMonitoringMembers
+              - guardduty:UpdateDetector
+            Resource: '*'
+            Condition:
+              ArnNotLike:
+                aws:PrincipalArn:
+                  - 'arn:aws:iam::*:role/OrganizationAccountAccessRole'
+                  - 'arn:aws:iam::*:role/AWSControlTowerExecution'
+          - Sid: DenyDisableSecurityHub
+            Effect: Deny
+            Action:
+              - securityhub:DisableSecurityHub
+              - securityhub:DeleteMembers
+              - securityhub:DisassociateFromMasterAccount
+              - securityhub:DisassociateMembers
+            Resource: '*'
+            Condition:
+              ArnNotLike:
+                aws:PrincipalArn:
+                  - 'arn:aws:iam::*:role/OrganizationAccountAccessRole'
+                  - 'arn:aws:iam::*:role/AWSControlTowerExecution'
+          - Sid: DenyDeleteCloudTrail
+            Effect: Deny
+            Action:
+              - cloudtrail:DeleteTrail
+              - cloudtrail:StopLogging
+              - cloudtrail:UpdateTrail
+            Resource: '*'
+            Condition:
+              ArnNotLike:
+                aws:PrincipalArn:
+                  - 'arn:aws:iam::*:role/OrganizationAccountAccessRole'
+                  - 'arn:aws:iam::*:role/AWSControlTowerExecution'
+      TargetIds:
+        - !GetAtt Organization.RootId
+
+Outputs:
+  OrganizationId:
+    Description: AWS Organization ID
+    Value: !Ref Organization
+    Export:
+      Name: !Sub '${AWS::StackName}-OrganizationId'
+
+  OrganizationRootId:
+    Description: Organization Root ID
+    Value: !GetAtt Organization.RootId
+    Export:
+      Name: !Sub '${AWS::StackName}-OrganizationRootId'
+
+  SecurityOUId:
+    Description: Security Organizational Unit ID
+    Value: !Ref SecurityOU
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityOUId'
+
+  WorkloadsOUId:
+    Description: Workloads Organizational Unit ID
+    Value: !Ref WorkloadsOU
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkloadsOUId'
+
+  ManagementAccountId:
+    Description: Management Account ID (manages all security services directly)
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-ManagementAccountId'
+
+  CloudTrailBucketName:
+    Description: CloudTrail S3 Bucket Name
+    Value: !Ref CloudTrailBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailBucketName'
+
+  CloudTrailArn:
+    Description: Organization CloudTrail ARN
+    Value: !GetAtt OrganizationTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
