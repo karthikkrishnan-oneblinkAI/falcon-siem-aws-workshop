@@ -1,0 +1,222 @@
+# ============================================================
+# SECRETS & ENVIRONMENT FILES — never commit these
+# ============================================================
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+.env.staging
+.env.test
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.secret
+*.secrets
+*credentials*
+*secret*
+serviceAccountKey.json
+gcp-key.json
+firebase-adminsdk*.json
+google-credentials.json
+
+# API keys, tokens, config with secrets
+config.local.*
+local_settings.py
+*.token
+
+# ============================================================
+# JSON FILES
+# ============================================================
+*.json
+# Exception: keep package manifests and configs you actually need
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.*.json
+!jsconfig.json
+!.eslintrc.json
+!.prettierrc.json
+!nest-cli.json
+!vercel.json
+!turbo.json
+!lerna.json
+!renovate.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!manifest.json
+!composer.json
+!Pipfile.lock
+
+# ============================================================
+# NODE / FRONTEND
+# ============================================================
+node_modules/
+.npm
+.yarn/
+.pnp.*
+bower_components/
+
+# Build output
+dist/
+build/
+out/
+.output/
+.next/
+.nuxt/
+.svelte-kit/
+.astro/
+.vercel/
+.netlify/
+.turbo/
+storybook-static/
+
+# Cache
+.cache/
+.parcel-cache/
+.eslintcache
+.stylelintcache
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Testing
+coverage/
+.nyc_output/
+cypress/videos/
+cypress/screenshots/
+playwright-report/
+
+# ============================================================
+# PYTHON / BACKEND
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env_py/
+ENV/
+.conda/
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+*.whl
+pip-wheel-metadata/
+
+# Distribution / packaging
+sdist/
+develop-eggs/
+.installed.cfg
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_metadata/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# ============================================================
+# DATABASES & DATA FILES
+# ============================================================
+*.sqlite3
+*.db
+*.db-journal
+*.sql.gz
+*.dump
+*.csv
+*.parquet
+
+# ============================================================
+# OS FILES
+# ============================================================
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ============================================================
+# IDE / EDITOR
+# ============================================================
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ============================================================
+# DOCKER
+# ============================================================
+docker-compose.override.yml
+.docker/
+
+# ============================================================
+# TERRAFORM / INFRA
+# ============================================================
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!*.tfvars.example
+
+# ============================================================
+# MISC
+# ============================================================
+*.log
+*.pid
+*.seed
+*.bak
+*.tmp
+*.temp
+*.swp
+.sass-cache/
+*.map
+
+# Large files
+*.zip
+*.tar.gz
+*.rar
+*.7z
+*.iso
