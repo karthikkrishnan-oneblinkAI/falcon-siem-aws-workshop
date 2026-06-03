@@ -568,15 +568,21 @@ Resources:
       Handler: index.handler
       Role: !GetAtt SecurityOrgConfigLambdaRole.Arn
       Timeout: 900
+      Environment:
+        Variables:
+          HOME_REGION: !Ref AWS::Region
       Code:
         ZipFile: |
           import boto3
           import cfnresponse
           import json
           import time
+          import os
           from botocore.exceptions import ClientError
 
-          REGIONS = ['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2']
+          # Security Hub: Home region + linked regions for aggregation
+          # GuardDuty: 4 US regions for comprehensive threat detection
+          ALL_REGIONS = ['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2']
           MAX_RETRIES = 5
           INITIAL_BACKOFF = 5
 
@@ -588,6 +594,7 @@ Resources:
                   properties = event['ResourceProperties']
                   audit_account_id = properties['AuditAccountId']
                   audit_role_arn = properties['AuditRoleArn']
+                  home_region = os.environ.get('HOME_REGION', 'us-east-2')
                   
                   if request_type in ['Create', 'Update']:
                       # Get all member accounts
@@ -598,22 +605,32 @@ Resources:
                       audit_credentials = assume_role(audit_role_arn)
                       
                       results = {
+                          'SecurityHubHomeRegion': home_region,
                           'SecurityHubRegions': [],
                           'GuardDutyRegions': [],
                           'MemberAccounts': len(accounts)
                       }
                       
-                      for region in REGIONS:
-                          print(f"\n=== Configuring region: {region} ===")
-                          
-                          # Configure Security Hub org-wide
+                      # Configure Security Hub in ALL 4 REGIONS (needed for GuardDuty integration)
+                      for region in ALL_REGIONS:
+                          print(f"\n=== Configuring Security Hub in region: {region} ===")
                           try:
                               configure_securityhub_org(audit_credentials, region, accounts)
                               results['SecurityHubRegions'].append(region)
                           except Exception as e:
                               print(f"Error configuring Security Hub in {region}: {str(e)}")
-                          
-                          # Configure GuardDuty org-wide
+                          time.sleep(2)
+                      
+                      # Configure Cross-Region Aggregation with home region
+                      print(f"\n=== Configuring Cross-Region Aggregation (Home: {home_region}) ===")
+                      try:
+                          configure_cross_region_aggregation(audit_credentials, home_region, ALL_REGIONS)
+                      except Exception as e:
+                          print(f"Error configuring cross-region aggregation: {str(e)}")
+                      
+                      # Configure GuardDuty in ALL 4 US REGIONS
+                      for region in ALL_REGIONS:
+                          print(f"\n=== Configuring GuardDuty in region: {region} ===")
                           try:
                               configure_guardduty_org(audit_credentials, region, accounts)
                               results['GuardDutyRegions'].append(region)
@@ -706,6 +723,48 @@ Resources:
                           pass  # Already a member, that's fine
                       else:
                           print(f"[{region}] Error adding member {account['AccountId']}: {str(e)}")
+
+          def configure_cross_region_aggregation(credentials, home_region, all_regions):
+              """Configure Security Hub cross-region aggregation with home region as aggregator"""
+              sh = boto3.client(
+                  'securityhub',
+                  region_name=home_region,
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken']
+              )
+              
+              # Get linked regions (all regions except home region)
+              linked_regions = [r for r in all_regions if r != home_region]
+              
+              try:
+                  # Check if finding aggregator already exists
+                  aggregators = sh.list_finding_aggregators()
+                  if aggregators.get('FindingAggregators'):
+                      aggregator_arn = aggregators['FindingAggregators'][0]['FindingAggregatorArn']
+                      print(f"[{home_region}] Finding aggregator already exists: {aggregator_arn}")
+                      
+                      # Update with current linked regions
+                      sh.update_finding_aggregator(
+                          FindingAggregatorArn=aggregator_arn,
+                          RegionLinkingMode='SPECIFIED_REGIONS',
+                          Regions=linked_regions
+                      )
+                      print(f"[{home_region}] Updated aggregator with linked regions: {linked_regions}")
+                  else:
+                      # Create new finding aggregator
+                      response = sh.create_finding_aggregator(
+                          RegionLinkingMode='SPECIFIED_REGIONS',
+                          Regions=linked_regions
+                      )
+                      print(f"[{home_region}] Created finding aggregator: {response['FindingAggregatorArn']}")
+                      print(f"[{home_region}] Linked regions: {linked_regions}")
+              except ClientError as e:
+                  if 'ResourceConflictException' in str(e) or 'already exists' in str(e).lower():
+                      print(f"[{home_region}] Finding aggregator configuration already exists")
+                  else:
+                      print(f"[{home_region}] Error configuring cross-region aggregation: {str(e)}")
+                      raise
 
           def configure_guardduty_org(credentials, region, accounts):
               """Configure GuardDuty organization-wide from Audit Account"""
