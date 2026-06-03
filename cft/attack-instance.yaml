@@ -1,0 +1,645 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CrowdStrike NGSIEM Workshop — Complete Attack Simulation Stack.
+  Deploys a production-style VPC with private subnets, NAT Gateway, VPC Endpoints,
+  and an AL2023 EC2 attack instance with SSM Session Manager access.
+  
+  Single deployment - no VPC parameters required!
+
+# ── Parameters ─────────────────────────────────────────────────────────────────
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: ngsiem-workshop
+    Description: Environment name prefix for all resources.
+
+  VpcCidr:
+    Type: String
+    Default: 10.99.0.0/16
+    Description: CIDR block for the VPC (using 10.99.x.x to avoid conflicts)
+
+  AttackTargetRegion:
+    Type: String
+    Default: ''
+    Description: AWS region where the attack simulation creates resources (leave empty for current region).
+
+  AttackTargetAmiId:
+    Type: String
+    Default: ''
+    Description: >
+      AMI ID for the rogue instance launched by the attack script.
+      Leave empty to auto-detect latest Amazon Linux 2023 AMI.
+
+  AttackWaitSeconds:
+    Type: Number
+    Default: 2700
+    MinValue: 60
+    MaxValue: 7200
+    Description: >
+      Seconds the attack script holds resources before cleanup (default 45 min).
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: Instance type for the attack simulation host.
+
+  InstanceAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: SSM parameter path for the attack instance OS (Amazon Linux 2023).
+
+Conditions:
+  UseAutoAmiId: !Equals [!Ref AttackTargetAmiId, '']
+
+# ── Resources ──────────────────────────────────────────────────────────────────
+Resources:
+
+  #############################################
+  # VPC
+  #############################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  #############################################
+  # Internet Gateway
+  #############################################
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  #############################################
+  # Public Subnets (2 AZs for NAT Gateways)
+  #############################################
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 8, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet-1'
+        - Key: Type
+          Value: Public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 8, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet-2'
+        - Key: Type
+          Value: Public
+
+  #############################################
+  # Private Subnets (2 AZs for Attack Instance)
+  #############################################
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 8, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-1'
+        - Key: Type
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 8, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-2'
+        - Key: Type
+          Value: Private
+
+  #############################################
+  # NAT Gateways (2 for High Availability)
+  #############################################
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-eip-1'
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-eip-2'
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-1'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-2'
+
+  #############################################
+  # Route Tables
+  #############################################
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt-1'
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt-2'
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  #############################################
+  # VPC Endpoints Security Group
+  #############################################
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-vpce-sg'
+      GroupDescription: Security group for VPC Endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: Allow HTTPS from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpce-sg'
+
+  #############################################
+  # VPC Endpoints for SSM Session Manager
+  #############################################
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+        - !Ref PublicRouteTable
+
+  #############################################
+  # Attack Instance IAM Role
+  #############################################
+  AttackInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "attack-instance-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AttackSimulationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: IAMCreateAndDelete
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:GetInstanceProfile
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/admin-role-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/admin-role-*"
+              - Sid: PassRoleToEC2
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/admin-role-*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+              - Sid: EC2AttackActions
+                Effect: Allow
+                Action:
+                  - ec2:CreateKeyPair
+                  - ec2:DeleteKeyPair
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeInstances
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:CreateTags
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: ngsiem-workshop
+
+  AttackInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "attack-instance-${AWS::StackName}"
+      Roles:
+        - !Ref AttackInstanceRole
+
+  #############################################
+  # Attack Instance Security Group
+  #############################################
+  AttackInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "attack-instance-${AWS::StackName}"
+      GroupDescription: Attack simulation instance - SSM only, no inbound rules.
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub "attack-instance-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  #############################################
+  # Attack EC2 Instance
+  #############################################
+  AttackInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SSMEndpoint
+      - SSMMessagesEndpoint
+      - EC2MessagesEndpoint
+      - NatGateway1
+    Properties:
+      ImageId: !Ref InstanceAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref AttackInstanceSG
+      IamInstanceProfile: !Ref AttackInstanceProfile
+      DisableApiTermination: false
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - ""
+            - - !Sub |
+                  #!/bin/bash
+                  set -e
+                  exec > >(tee /var/log/user-data.log | logger -t user-data -s) 2>&1
+
+                  echo "==> Installing dependencies"
+                  dnf update -y
+                  dnf install -y jq
+
+                  # Get the latest AL2023 AMI ID for the attack target
+                  ATTACK_AMI="${AttackTargetAmiId}"
+                  if [ -z "$ATTACK_AMI" ]; then
+                    ATTACK_AMI=$(aws ssm get-parameter \
+                      --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+                      --query 'Parameter.Value' --output text --region ${AWS::Region} 2>/dev/null || echo "ami-0c55b159cbfafe1f0")
+                  fi
+
+                  # Bake CloudFormation values into a profile.d script
+                  echo "==> Writing /etc/profile.d/aws_paygo_config.sh"
+                  cat > /etc/profile.d/aws_paygo_config.sh << CFGEOF
+                  export ATTACK_REGION="${AWS::Region}"
+                  export ATTACK_VPC_ID="${VPC}"
+                  export ATTACK_AMI_ID="$ATTACK_AMI"
+                  export ATTACK_WAIT="${AttackWaitSeconds}"
+                  CFGEOF
+                  chmod 644 /etc/profile.d/aws_paygo_config.sh
+
+                  echo "==> Writing /usr/local/bin/aws_paygo"
+              - |
+                  cat > /usr/local/bin/aws_paygo << 'ENDSCRIPT'
+                  #!/bin/bash
+                  # aws_paygo — CrowdStrike NGSIEM Workshop Attack Simulation
+                  set -uo pipefail
+
+                  [[ -f /etc/profile.d/aws_paygo_config.sh ]] && source /etc/profile.d/aws_paygo_config.sh
+
+                  REGION="${ATTACK_REGION:-us-east-1}"
+                  VPC_ID="${ATTACK_VPC_ID:-}"
+                  AMI_ID="${ATTACK_AMI_ID:-ami-0c55b159cbfafe1f0}"
+                  WAIT_SECS="${ATTACK_WAIT:-2700}"
+
+                  if [[ -z "$VPC_ID" ]]; then
+                    echo "ERROR: ATTACK_VPC_ID is not set." >&2
+                    exit 1
+                  fi
+
+                  if ! command -v jq &>/dev/null; then
+                    echo "ERROR: jq is required but not installed." >&2
+                    exit 1
+                  fi
+
+                  RANDOM_STRING=$(cat /dev/urandom | LC_ALL=C tr -dc 'a-z' | fold -w 4 | head -n 1)
+                  ROLE_NAME="admin-role-$RANDOM_STRING"
+                  KEY_NAME="admin-$RANDOM_STRING"
+                  PEM_FILE=$(mktemp /tmp/admin-XXXXXX.pem)
+                  INSTANCE_ID=""
+                  SG_ID=""
+
+                  cleanup() {
+                    echo ""
+                    echo "── Cleaning up attack resources ──────────────────────────"
+                    rm -f "$PEM_FILE"
+                    if [[ -n "$INSTANCE_ID" ]]; then
+                      echo "  Terminating instance: $INSTANCE_ID"
+                      aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true
+                      echo "  Waiting 60s for termination..."
+                      sleep 60
+                    fi
+                    if [[ -n "$SG_ID" ]]; then
+                      echo "  Deleting security group: $SG_ID"
+                      aws ec2 delete-security-group --group-id "$SG_ID" --region "$REGION" 2>/dev/null || true
+                    fi
+                    aws ec2 delete-key-pair --key-name "$KEY_NAME" --region "$REGION" 2>/dev/null || true
+                    aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/AdministratorAccess 2>/dev/null || true
+                    aws iam remove-role-from-instance-profile --instance-profile-name "$ROLE_NAME" --role-name "$ROLE_NAME" 2>/dev/null || true
+                    aws iam delete-instance-profile --instance-profile-name "$ROLE_NAME" 2>/dev/null || true
+                    aws iam delete-role --role-name "$ROLE_NAME" 2>/dev/null || true
+                    echo "  Done.  End: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+                  }
+                  trap cleanup EXIT
+
+                  START_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+                  echo "============================================================"
+                  echo " CrowdStrike NGSIEM Workshop — Attack Simulation"
+                  echo " Start:  $START_TIME"
+                  echo " Suffix: $RANDOM_STRING  |  Region: $REGION  |  VPC: $VPC_ID"
+                  echo "============================================================"
+
+                  echo "[1/8] Creating IAM role: $ROLE_NAME"
+                  aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document '{
+                    "Version": "2012-10-17",
+                    "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole", "Principal": {"Service": "ec2.amazonaws.com"}}]
+                  }' --description "IAM role for admin" > /dev/null
+
+                  echo "[2/8] Attaching AdministratorAccess to $ROLE_NAME"
+                  aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+
+                  echo "[3/8] Creating instance profile: $ROLE_NAME"
+                  aws iam create-instance-profile --instance-profile-name "$ROLE_NAME" > /dev/null
+
+                  echo "[4/8] Adding role to instance profile"
+                  aws iam add-role-to-instance-profile --role-name "$ROLE_NAME" --instance-profile-name "$ROLE_NAME"
+
+                  echo "[5/8] Creating key pair: $KEY_NAME"
+                  aws ec2 create-key-pair --key-name "$KEY_NAME" --query 'KeyMaterial' --output text --region "$REGION" > "$PEM_FILE"
+                  chmod 600 "$PEM_FILE"
+
+                  echo "[6/8] Reconnaissance..."
+                  aws ec2 describe-vpcs --region "$REGION" > /dev/null
+                  SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[0].SubnetId' --output text --region "$REGION")
+                  echo "  Using subnet: $SUBNET_ID"
+                  aws ec2 describe-security-groups --region "$REGION" > /dev/null
+
+                  echo "[7/8] Creating security group with SSH open to 0.0.0.0/0"
+                  SG_NAME="SSH-Access-$(date +%Y%m%d-%H%M%S)"
+                  SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "Security group allowing SSH access" --vpc-id "$VPC_ID" --region "$REGION" --query 'GroupId' --output text)
+                  echo "  Created: $SG_NAME ($SG_ID)"
+                  aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0 --region "$REGION" > /dev/null
+
+                  echo "[8/8] Waiting for IAM instance profile to propagate..."
+                  for i in $(seq 1 20); do
+                    if aws iam get-instance-profile --instance-profile-name "$ROLE_NAME" --query 'InstanceProfile.InstanceProfileName' --output text 2>/dev/null | grep -q "$ROLE_NAME"; then
+                      echo "  Profile visible after ~$((i * 5))s"
+                      break
+                    fi
+                    echo "  Not ready yet ($i/20), retrying in 5s..."
+                    sleep 5
+                  done
+                  sleep 10
+                  echo "  Launching EC2 instance..."
+                  INSTANCE_ID=$(aws ec2 run-instances --image-id "$AMI_ID" --instance-type t3.large --key-name "$KEY_NAME" --security-group-ids "$SG_ID" --subnet-id "$SUBNET_ID" --iam-instance-profile Name="$ROLE_NAME" --count 1 --region "$REGION" --query 'Instances[0].InstanceId' --output text)
+                  echo "  Launched: $INSTANCE_ID"
+
+                  echo ""
+                  echo "============================================================"
+                  echo " Attack resources are live."
+                  echo " Instance: $INSTANCE_ID"
+                  echo " Waiting $WAIT_SECS seconds before cleanup..."
+                  echo " (Ctrl+C triggers cleanup immediately)"
+                  echo "============================================================"
+                  sleep "$WAIT_SECS"
+                  ENDSCRIPT
+
+                  chmod +x /usr/local/bin/aws_paygo
+                  echo "==> Attack simulation instance is ready."
+                  echo "    Connect via SSM Session Manager and run: aws_paygo"
+
+      Tags:
+        - Key: Name
+          Value: !Sub "attack-instance-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: ngsiem-workshop
+
+# ── Outputs ────────────────────────────────────────────────────────────────────
+Outputs:
+
+  VpcId:
+    Description: VPC ID created for the attack simulation
+    Value: !Ref VPC
+
+  PublicSubnet1Id:
+    Description: Public subnet 1 ID
+    Value: !Ref PublicSubnet1
+
+  PublicSubnet2Id:
+    Description: Public subnet 2 ID
+    Value: !Ref PublicSubnet2
+
+  PrivateSubnet1Id:
+    Description: Private subnet 1 where the attack instance runs
+    Value: !Ref PrivateSubnet1
+
+  PrivateSubnet2Id:
+    Description: Private subnet 2 ID
+    Value: !Ref PrivateSubnet2
+
+  InstanceId:
+    Description: Attack simulation instance ID
+    Value: !Ref AttackInstance
+
+  SSMConnectCommand:
+    Description: Command to open an SSM session to the attack instance
+    Value: !Sub "aws ssm start-session --target ${AttackInstance} --region ${AWS::Region}"
+
+  AttackCommand:
+    Description: Command to run once connected via SSM
+    Value: aws_paygo
+
+  UserDataLog:
+    Description: UserData bootstrap log location on the instance
+    Value: /var/log/user-data.log
+
+  NatGateway1PublicIp:
+    Description: NAT Gateway 1 Public IP (AZ-a traffic exits through this IP)
+    Value: !Ref NatGateway1EIP
+
+  NatGateway2PublicIp:
+    Description: NAT Gateway 2 Public IP (AZ-b traffic exits through this IP)
+    Value: !Ref NatGateway2EIP

@@ -7,6 +7,7 @@ This lab deploys a complete AWS Organization with security services (Security Hu
 - AWS Account with no existing Organization (fresh Workshop Studio account)
 - AWS CLI configured with Administrator access
 - Unique email address for the Audit Account
+- Unique email address for the Workload Account
 
 ## Architecture Overview
 
@@ -19,13 +20,19 @@ This lab deploys a complete AWS Organization with security services (Security Hu
 │  ├── GuardDuty (enabled)                                         │
 │  ├── CloudTrail (Organization Trail)                             │
 │  ├── StackSets (trusted access enabled)                          │
-│  └── SCPs (DenyDisableSecurityServices)                          │
+│  ├── SSM (trusted access enabled for Fleet Manager)              │
+│  ├── AWS Config (trusted access enabled)                         │
+│  ├── IAM Root Access Consolidation (trusted access enabled)      │
+│  ├── License Manager (trusted access enabled)                    │
+│  └── SCPs:                                                       │
+│       ├── DenyDisableSecurityServices                            │
+│       └── AllowOnlyUSRegions (us-east-1/2, us-west-1/2)         │
 ├─────────────────────────────────────────────────────────────────┤
 │  Organizational Units                                            │
 │  ├── Security OU                                                 │
 │  │   └── Audit Account (Delegated Admin for SecurityHub/GuardDuty)│
 │  └── Workloads OU                                                │
-│       └── (Future workload accounts)                             │
+│       └── Workload Account (workshop workloads)                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -35,7 +42,7 @@ This lab deploys a complete AWS Organization with security services (Security Hu
 
 ### Step 1: Deploy Organization & Security Services
 
-This creates the AWS Organization, OUs, Audit Account, and enables all security services.
+This creates the AWS Organization, OUs, Audit Account, Workload Account, and enables all security services.
 
 ```bash
 aws cloudformation deploy \
@@ -43,25 +50,35 @@ aws cloudformation deploy \
   --stack-name org-security-services \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
-    AuditAccountEmail=audit@your-domain.com
+    AuditAccountEmail=audit@your-domain.com \
+    WorkloadAccountEmail=workload@your-domain.com
 ```
 
 **Parameters:**
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | `AuditAccountEmail` | Unique email for Audit Account | `workshop-audit@example.com` |
+| `WorkloadAccountEmail` | Unique email for Workload Account | `workshop-workload@example.com` |
 
 **Deployment Time:** ~15-20 minutes
 
 **What it creates:**
 - AWS Organization with ALL features enabled
 - Security OU and Workloads OU
-- Audit Account (delegated administrator)
-- Security Hub with Audit Account as delegated admin
-- GuardDuty with Audit Account as delegated admin
+- Audit Account (delegated administrator) in Security OU
+- Workload Account in Workloads OU
+- Security Hub with Audit Account as delegated admin (organization-wide, all 4 US regions)
+- GuardDuty with Audit Account as delegated admin (organization-wide, all 4 US regions, all protection plans enabled)
 - Organization CloudTrail with S3 bucket and SNS topic
-- StackSets trusted access
-- SCP to prevent disabling security services
+- AWS Service Access enabled for:
+  - **StackSets** - Organization-wide CloudFormation deployments
+  - **Systems Manager (SSM)** - Fleet Manager and instance management
+  - **AWS Config** - Centralized compliance monitoring
+  - **IAM Root Access Consolidation** - Centralized root credential management
+  - **License Manager** - Organization-wide license sharing
+- Service Control Policies (SCPs):
+  - **DenyDisableSecurityServices**: Prevents disabling GuardDuty, Security Hub, and CloudTrail
+  - **AllowOnlyUSRegions**: Restricts resource creation to us-east-1, us-east-2, us-west-1, us-west-2 only
 
 ### Step 2: Enable IAM Identity Center (Manual)
 
@@ -102,7 +119,7 @@ aws cloudformation deploy \
 - Admin user in Identity Store
 - `WorkshopAdmins` group
 - `AdministratorAccess` permission set (8-hour sessions)
-- Group assigned to all member accounts (Audit Account, etc.)
+- Group assigned to all member accounts (Audit Account, Workload Account)
 
 ### Step 4: Send Password Email to User (Manual)
 
@@ -162,6 +179,7 @@ aws cloudformation describe-organizations-access
 3. Verify you see all accounts:
    - Management Account
    - Audit Account
+   - Workload Account
 
 ---
 
@@ -175,6 +193,7 @@ aws cloudformation describe-organizations-access
 | `SecurityOUId` | Security OU ID |
 | `WorkloadsOUId` | Workloads OU ID |
 | `AuditAccountId` | Audit Account ID |
+| `WorkloadAccountId` | Workload Account ID |
 | `CloudTrailBucketName` | CloudTrail S3 bucket name |
 | `CloudTrailArn` | Organization CloudTrail ARN |
 

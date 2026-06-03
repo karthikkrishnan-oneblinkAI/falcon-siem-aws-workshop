@@ -3,8 +3,13 @@ Description: |
   CloudFormation template to configure IAM Identity Center (AWS SSO) for an AWS Organization.
   Creates an admin user and group with AdministratorAccess to all accounts.
   
+  Automatically assigns access to all accounts including:
+  - Management Account
+  - Audit Account (Security OU)
+  - Workload Account (Workloads OU)
+  
   Prerequisites: 
-  - AWS Organization must exist
+  - AWS Organization must exist (deploy org-security-services.yaml first)
   - IAM Identity Center must be ENABLED MANUALLY first via AWS Console
     (Go to IAM Identity Center console and click "Enable")
 

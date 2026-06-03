@@ -13,14 +13,26 @@ Metadata:
           default: Audit Account Configuration
         Parameters:
           - AuditAccountEmail
+      - Label:
+          default: Workload Account Configuration
+        Parameters:
+          - WorkloadAccountEmail
     ParameterLabels:
       AuditAccountEmail:
         default: Audit Account Email Address
+      WorkloadAccountEmail:
+        default: Workload Account Email Address
 
 Parameters:
   AuditAccountEmail:
     Type: String
     Description: Email address for the Audit Account (must be unique and not already associated with an AWS account)
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  WorkloadAccountEmail:
+    Type: String
+    Description: Email address for the Workload Account (must be unique and not already associated with an AWS account)
     AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     ConstraintDescription: Must be a valid email address
 
@@ -65,6 +77,24 @@ Resources:
       Tags:
         - Key: Purpose
           Value: AuditDelegatedAdmin
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################
+  # Workload Account (in Workloads OU)
+  #############################################
+  WorkloadAccount:
+    Type: AWS::Organizations::Account
+    DependsOn: WorkloadsOU
+    Properties:
+      AccountName: Workload
+      Email: !Ref WorkloadAccountEmail
+      ParentIds:
+        - !Ref WorkloadsOU
+      RoleName: OrganizationAccountAccessRole
+      Tags:
+        - Key: Purpose
+          Value: Workload
         - Key: ManagedBy
           Value: CloudFormation
 
@@ -496,6 +526,267 @@ Resources:
       AdminAccountId: !GetAtt AuditAccount.AccountId
 
   #############################################
+  # Organization-wide Security Services Configuration
+  # Enables Security Hub & GuardDuty in all accounts and regions
+  #############################################
+  
+  # Lambda Role for cross-account security configuration
+  SecurityOrgConfigLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SecurityOrgConfigRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CrossAccountSecurityConfig
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${AuditAccount.AccountId}:role/OrganizationAccountAccessRole'
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                Resource: '*'
+
+  # Lambda Function for organization-wide security configuration
+  SecurityOrgConfigLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'SecurityOrgConfig-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt SecurityOrgConfigLambdaRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import time
+          from botocore.exceptions import ClientError
+
+          REGIONS = ['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2']
+          MAX_RETRIES = 5
+          INITIAL_BACKOFF = 5
+
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              
+              try:
+                  request_type = event['RequestType']
+                  properties = event['ResourceProperties']
+                  audit_account_id = properties['AuditAccountId']
+                  audit_role_arn = properties['AuditRoleArn']
+                  
+                  if request_type in ['Create', 'Update']:
+                      # Get all member accounts
+                      org_client = boto3.client('organizations')
+                      accounts = get_member_accounts(org_client)
+                      
+                      # Assume role in Audit Account and configure services
+                      audit_credentials = assume_role(audit_role_arn)
+                      
+                      results = {
+                          'SecurityHubRegions': [],
+                          'GuardDutyRegions': [],
+                          'MemberAccounts': len(accounts)
+                      }
+                      
+                      for region in REGIONS:
+                          print(f"\n=== Configuring region: {region} ===")
+                          
+                          # Configure Security Hub org-wide
+                          try:
+                              configure_securityhub_org(audit_credentials, region, accounts)
+                              results['SecurityHubRegions'].append(region)
+                          except Exception as e:
+                              print(f"Error configuring Security Hub in {region}: {str(e)}")
+                          
+                          # Configure GuardDuty org-wide
+                          try:
+                              configure_guardduty_org(audit_credentials, region, accounts)
+                              results['GuardDutyRegions'].append(region)
+                          except Exception as e:
+                              print(f"Error configuring GuardDuty in {region}: {str(e)}")
+                          
+                          time.sleep(2)  # Rate limiting between regions
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, results)
+                  
+                  elif request_type == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+          def assume_role(role_arn):
+              """Assume role in the Audit Account"""
+              sts = boto3.client('sts')
+              response = sts.assume_role(
+                  RoleArn=role_arn,
+                  RoleSessionName='SecurityOrgConfig',
+                  DurationSeconds=3600
+              )
+              return response['Credentials']
+
+          def get_member_accounts(org_client):
+              """Get all active member accounts in the organization"""
+              accounts = []
+              paginator = org_client.get_paginator('list_accounts')
+              for page in paginator.paginate():
+                  for account in page['Accounts']:
+                      if account['Status'] == 'ACTIVE':
+                          accounts.append({
+                              'AccountId': account['Id'],
+                              'Email': account['Email']
+                          })
+              print(f"Found {len(accounts)} active accounts")
+              return accounts
+
+          def configure_securityhub_org(credentials, region, accounts):
+              """Configure Security Hub organization-wide from Audit Account"""
+              sh = boto3.client(
+                  'securityhub',
+                  region_name=region,
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken']
+              )
+              
+              # First ensure Security Hub is enabled in Audit Account
+              try:
+                  sh.enable_security_hub(EnableDefaultStandards=True)
+                  print(f"[{region}] Enabled Security Hub in Audit Account")
+                  time.sleep(5)
+              except sh.exceptions.ResourceConflictException:
+                  print(f"[{region}] Security Hub already enabled in Audit Account")
+              except Exception as e:
+                  print(f"[{region}] Error enabling Security Hub: {str(e)}")
+              
+              # Configure organization-wide auto-enable
+              for attempt in range(MAX_RETRIES):
+                  try:
+                      sh.update_organization_configuration(
+                          AutoEnable=True,
+                          AutoEnableStandards='DEFAULT'
+                      )
+                      print(f"[{region}] Security Hub auto-enable configured")
+                      break
+                  except ClientError as e:
+                      if attempt < MAX_RETRIES - 1:
+                          print(f"[{region}] Retrying org config... ({str(e)})")
+                          time.sleep(INITIAL_BACKOFF * (attempt + 1))
+                      else:
+                          print(f"[{region}] Failed to configure org: {str(e)}")
+              
+              # Enroll existing accounts as members
+              for account in accounts:
+                  try:
+                      sh.create_members(
+                          AccountDetails=[{
+                              'AccountId': account['AccountId'],
+                              'Email': account['Email']
+                          }]
+                      )
+                      print(f"[{region}] Added member: {account['AccountId']}")
+                  except ClientError as e:
+                      if 'already a member' in str(e).lower() or 'ResourceConflict' in str(e):
+                          pass  # Already a member, that's fine
+                      else:
+                          print(f"[{region}] Error adding member {account['AccountId']}: {str(e)}")
+
+          def configure_guardduty_org(credentials, region, accounts):
+              """Configure GuardDuty organization-wide from Audit Account"""
+              gd = boto3.client(
+                  'guardduty',
+                  region_name=region,
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken']
+              )
+              
+              # Get or create detector
+              detector_id = None
+              detectors = gd.list_detectors()
+              if detectors['DetectorIds']:
+                  detector_id = detectors['DetectorIds'][0]
+                  print(f"[{region}] Using existing GuardDuty detector: {detector_id}")
+              else:
+                  response = gd.create_detector(
+                      Enable=True,
+                      DataSources={
+                          'S3Logs': {'Enable': True},
+                          'Kubernetes': {'AuditLogs': {'Enable': True}},
+                          'MalwareProtection': {'ScanEc2InstanceWithFindings': {'EbsVolumes': True}}
+                      }
+                  )
+                  detector_id = response['DetectorId']
+                  print(f"[{region}] Created GuardDuty detector: {detector_id}")
+                  time.sleep(5)
+              
+              # Configure organization-wide auto-enable
+              for attempt in range(MAX_RETRIES):
+                  try:
+                      gd.update_organization_configuration(
+                          DetectorId=detector_id,
+                          AutoEnable=True,
+                          AutoEnableOrganizationMembers='ALL',
+                          DataSources={
+                              'S3Logs': {'AutoEnable': True},
+                              'Kubernetes': {'AuditLogs': {'AutoEnable': True}},
+                              'MalwareProtection': {'ScanEc2InstanceWithFindings': {'EbsVolumes': {'AutoEnable': True}}}
+                          }
+                      )
+                      print(f"[{region}] GuardDuty auto-enable configured")
+                      break
+                  except ClientError as e:
+                      if attempt < MAX_RETRIES - 1:
+                          print(f"[{region}] Retrying org config... ({str(e)})")
+                          time.sleep(INITIAL_BACKOFF * (attempt + 1))
+                      else:
+                          print(f"[{region}] Failed to configure org: {str(e)}")
+              
+              # Enroll existing accounts as members
+              for account in accounts:
+                  try:
+                      gd.create_members(
+                          DetectorId=detector_id,
+                          AccountDetails=[{
+                              'AccountId': account['AccountId'],
+                              'Email': account['Email']
+                          }]
+                      )
+                      print(f"[{region}] Added GuardDuty member: {account['AccountId']}")
+                  except ClientError as e:
+                      if 'already a member' in str(e).lower() or 'already exists' in str(e).lower():
+                          pass  # Already a member
+                      else:
+                          print(f"[{region}] Error adding member {account['AccountId']}: {str(e)}")
+
+  # Custom resource to configure organization-wide security
+  ConfigureOrgSecurity:
+    Type: Custom::ConfigureOrgSecurity
+    DependsOn:
+      - GuardDutyServiceAccess
+      - SecurityHubServiceAccess
+    Properties:
+      ServiceToken: !GetAtt SecurityOrgConfigLambda.Arn
+      AuditAccountId: !GetAtt AuditAccount.AccountId
+      AuditRoleArn: !Sub 'arn:aws:iam::${AuditAccount.AccountId}:role/OrganizationAccountAccessRole'
+
+  #############################################
   # CloudTrail Configuration
   #############################################
   
@@ -647,15 +938,72 @@ Resources:
       ServiceType: stacksets
 
   #############################################
+  # AWS Systems Manager (SSM) Configuration
+  # Enables organization-wide SSM features like Fleet Manager,
+  # centralized inventory, and Session Manager access.
+  # Session activity is logged via CloudTrail for NG-SIEM visibility.
+  #############################################
+  SSMServiceAccess:
+    Type: Custom::EnableServiceAccess
+    DependsOn:
+      - StackSetsTrustedAccess
+    Properties:
+      ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
+      ServicePrincipal: ssm.amazonaws.com
+      ServiceType: ssm
+
+  #############################################
+  # AWS Config Configuration
+  # Enables organization-wide Config rules and conformance packs.
+  # Required for centralized compliance monitoring.
+  #############################################
+  ConfigServiceAccess:
+    Type: Custom::EnableServiceAccess
+    DependsOn:
+      - SSMServiceAccess
+    Properties:
+      ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
+      ServicePrincipal: config.amazonaws.com
+      ServiceType: config
+
+  #############################################
+  # IAM Root Access Consolidation
+  # Enables centralized management of root credentials across
+  # the organization from the management account.
+  #############################################
+  IAMServiceAccess:
+    Type: Custom::EnableServiceAccess
+    DependsOn:
+      - ConfigServiceAccess
+    Properties:
+      ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
+      ServicePrincipal: iam.amazonaws.com
+      ServiceType: iam
+
+  #############################################
+  # AWS Marketplace License Management
+  # Enables organization-wide license management and sharing
+  # of purchased software licenses across member accounts.
+  #############################################
+  LicenseManagerServiceAccess:
+    Type: Custom::EnableServiceAccess
+    DependsOn:
+      - IAMServiceAccess
+    Properties:
+      ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
+      ServicePrincipal: license-manager.amazonaws.com
+      ServiceType: license-manager
+
+  #############################################
   # Service Control Policies
-  # Runs after StackSets to fully serialize Org modifications
+  # Runs after all service access enablements to serialize Org modifications
   #############################################
   
   # Enable SCP Policy Type first
   EnableSCPPolicyType:
     Type: Custom::EnableServiceAccess
     DependsOn:
-      - StackSetsTrustedAccess
+      - LicenseManagerServiceAccess
     Properties:
       ServiceToken: !GetAtt EnableServiceAccessLambda.Arn
       ServicePrincipal: organizations.amazonaws.com
@@ -716,6 +1064,78 @@ Resources:
       TargetIds:
         - !GetAtt Organization.RootId
 
+  # Region Restriction SCP - Allow only 4 US regions
+  RegionRestrictionSCP:
+    Type: AWS::Organizations::Policy
+    DependsOn: DenyDisableSecurityServicesSCP
+    Properties:
+      Name: AllowOnlyUSRegions
+      Description: Restricts resource creation to us-east-1, us-east-2, us-west-1, and us-west-2 only
+      Type: SERVICE_CONTROL_POLICY
+      Content:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyAllOutsideAllowedRegions
+            Effect: Deny
+            NotAction:
+              # Global services that don't require region restriction
+              - a4b:*
+              - acm:*
+              - aws-marketplace-management:*
+              - aws-marketplace:*
+              - aws-portal:*
+              - budgets:*
+              - ce:*
+              - chime:*
+              - cloudfront:*
+              - config:*
+              - cur:*
+              - directconnect:*
+              - ec2:DescribeRegions
+              - ec2:DescribeTransitGateways
+              - ec2:DescribeVpnGateways
+              - fms:*
+              - globalaccelerator:*
+              - health:*
+              - iam:*
+              - importexport:*
+              - kms:*
+              - mobileanalytics:*
+              - networkmanager:*
+              - organizations:*
+              - pricing:*
+              - route53:*
+              - route53domains:*
+              - route53-recovery-cluster:*
+              - route53-recovery-control-config:*
+              - route53-recovery-readiness:*
+              - s3:GetAccountPublic*
+              - s3:ListAllMyBuckets
+              - s3:ListMultiRegionAccessPoints
+              - s3:PutAccountPublic*
+              - shield:*
+              - sts:*
+              - support:*
+              - trustedadvisor:*
+              - waf-regional:*
+              - waf:*
+              - wafv2:*
+              - wellarchitected:*
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                aws:RequestedRegion:
+                  - us-east-1
+                  - us-east-2
+                  - us-west-1
+                  - us-west-2
+              ArnNotLike:
+                aws:PrincipalArn:
+                  - 'arn:aws:iam::*:role/OrganizationAccountAccessRole'
+                  - 'arn:aws:iam::*:role/AWSControlTowerExecution'
+      TargetIds:
+        - !GetAtt Organization.RootId
+
 Outputs:
   OrganizationId:
     Description: AWS Organization ID
@@ -752,6 +1172,12 @@ Outputs:
     Value: !GetAtt AuditAccount.AccountId
     Export:
       Name: !Sub '${AWS::StackName}-AuditAccountId'
+
+  WorkloadAccountId:
+    Description: Workload Account ID (in Workloads OU)
+    Value: !GetAtt WorkloadAccount.AccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkloadAccountId'
 
   CloudTrailBucketName:
     Description: CloudTrail S3 Bucket Name
